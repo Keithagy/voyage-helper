@@ -20,7 +20,6 @@ from telegram.ext import (
     filters,
 )
 
-SUMMARIZED_ENTRY_KEY = "summarized_entry"
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -31,6 +30,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 INPUT_SELECT, CONFIRM_OR_EDIT, EDITING_RAW = range(3)
+SUMMARIZED_ENTRY_KEY = "summarized_entry"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
