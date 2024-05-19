@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-import os
+import os, requests
 from typing import Any, Callable, Coroutine, Optional
 
 from openai import OpenAI
@@ -284,15 +284,25 @@ def clear_conversation_context(context: ContextTypes.DEFAULT_TYPE):
 def inject_open_ai_client(client: OpenAI, handler):
     return handler(client)
 
+# source: https://github.com/kaxing/simple-telegram-gpt-bot/blob/main/main.py
+def railway_dns_workaround():
+    from time import sleep
+    sleep(1.3)
+    for _ in range(3):
+        if requests.get("https://api.telegram.org", timeout=3).status_code == 200:
+            print("The api.telegram.org is reachable.")
+            return
+        print(f'The api.telegram.org is not reachable. Retrying...({_})')
+    print("Failed to reach api.telegram.org after 3 attempts.")
 
 def main(open_ai_api_key: str, telegram_bot_token: str) -> None:
     """Run the bot."""
+    railway_dns_workaround()
     open_ai_client = OpenAI(api_key=open_ai_api_key)
     # Create the Application and pass it your bot's token.
     application = (
         Application.builder()
         .token(telegram_bot_token)
-        .arbitrary_callback_data(True)
         .build()
     )
 
