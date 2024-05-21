@@ -7,6 +7,8 @@ from typing import Any, Callable, Coroutine, Optional
 
 from openai import OpenAI
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -49,7 +51,17 @@ def start(
 
         message = update.message
         if not message:
-            return AWAITING_RAW_INPUT
+            return ConversationHandler.END
+
+        if message.chat.type != "private":
+            bot_link = f"https://t.me/{context.bot.username}"
+            keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await message.reply_text(
+                f"@{message.from_user.username}, please reach out in my private chat. Thank you!",
+                reply_markup=reply_markup,
+            )
+            return ConversationHandler.END
 
         await message.reply_text(
             "Hello voyager! Welcome to your energy accounting assistant. "
