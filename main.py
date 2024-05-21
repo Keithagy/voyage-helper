@@ -86,7 +86,7 @@ def start(
 
         if len(group_ids_accessible_for_user) == 1:
             await message.reply_text(
-                f"You're part of just the one Astralship telegram channel ({( await context.bot.get_chat(group_ids_accessible_for_user[0]) ).effective_name}), so I'll take it that you're doing energy accounting for that."
+                f"You're part of just the one Astralship telegram channel ({( await context.bot.get_chat(group_ids_accessible_for_user[0]) ).effective_name}), so I'll take it that you're doing energy accounting for that. "
                 "Whenever you're ready, tell me via voice or text what you did today and how much time it took."
             )
             context_chat_data = context.chat_data
