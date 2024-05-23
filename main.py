@@ -66,6 +66,29 @@ class EnergyAccountModel(Base):
     )
 
 
+async def handle_uninitialized_voice_text_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    message = update.message
+    if not message:
+        return ConversationHandler.END
+
+    if message.chat.type != "private":
+        bot_link = f"https://t.me/{context.bot.username}"
+        keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text(
+            f"{message.from_user.name}, are you trying to log a new energy account? This channel should be for announcements only. Please click the button below to open our private chat, then try again with /start. Thank you!",
+            reply_markup=reply_markup,
+        )
+        return ConversationHandler.END
+
+    await message.reply_text(
+        f"Hi {message.from_user.name}, please /start me first. Thank you!"
+    )
+    return ConversationHandler.END
+
+
 def start(
     allowed_groups: TelegramGroupIdLookup,
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
@@ -83,7 +106,7 @@ def start(
             keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await message.reply_text(
-                f"@{message.from_user.username}, please reach out in my private chat. Thank you!",
+                f"{message.from_user.name}, please click the button below to open our private chat, then try again with /start. Thank you!",
                 reply_markup=reply_markup,
             )
             return ConversationHandler.END
@@ -483,12 +506,25 @@ def main(
     """Run the bot."""
     railway_dns_workaround()
     open_ai_client = OpenAI(api_key=open_ai_api_key)
-    application = Application.builder().token(telegram_bot_token).build()
+    application = (
+        Application.builder()
+        .concurrent_updates(
+            False
+        )  # Needed for ConversationHandler to function correctly
+        .token(telegram_bot_token)
+        .build()
+    )
 
     new_from_text_handler = new_from_text(open_ai_client)
     new_from_voice_handler = new_from_voice(open_ai_client)
+    sending_text_or_voice_without_start_handler = MessageHandler(
+        filters.VOICE | filters.TEXT, handle_uninitialized_voice_text_input
+    )
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start(allowed_groups))],
+        entry_points=[
+            CommandHandler("start", start(allowed_groups)),
+            sending_text_or_voice_without_start_handler,
+        ],
         states={
             AWAITING_GROUP_SELECTION: [
                 MessageHandler(
@@ -515,7 +551,6 @@ def main(
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     application.add_handler(conv_handler)
 
     # Run the bot until the user presses Ctrl-C
