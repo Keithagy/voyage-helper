@@ -5,6 +5,12 @@ import os
 import requests
 from typing import Any, Callable, Coroutine, Optional
 
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Index
+from sqlalchemy.orm import sessionmaker, declarative_base
+import uuid
+
 from openai import OpenAI
 from telegram import (
     InlineKeyboardButton,
@@ -30,7 +36,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 # set higher logging level for httpx to avoid all GET and POST requests being logged
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,25 @@ SUMMARIZED_ENTRY_KEY = "summarized_entry"
 SELECTED_GROUP_ID_KEY = "selected_group_id"
 SELECTABLE_GROUPS_KEY = "selectable_groups"
 PRODUCTION_ENV_NAME = "production"
+
+Base = declarative_base()
+
+
+class EnergyAccountModel(Base):
+    __tablename__ = "energy_accounts"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tg_user_id = Column(Integer)
+    audit_tg_username = Column(String)
+    tg_group_id = Column(Integer)
+    audit_tg_group_name = Column(String)
+    hours_logged = Column(Float)
+    description = Column(String)
+    timestamp = Column(DateTime)
+
+    __table_args__ = (
+        Index("idx_tg_user_id", tg_user_id),
+        Index("idx_tg_group_id", tg_group_id),
+    )
 
 
 def start(
@@ -319,6 +344,7 @@ def add_summary_to_context(summary: str, context: ContextTypes.DEFAULT_TYPE):
 
 def handle_confirm(
     allowed_groups: TelegramGroupIdLookup,
+    session: sessionmaker,
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
 
     async def decorated_handler(
@@ -338,14 +364,36 @@ def handle_confirm(
         message = update.message
         if not message:
             return AWAITING_RAW_INPUT
-        await message.reply_text(text="Energy accounted. Thank you for your work!")
 
         selected_group_id = chat_data_context[SELECTED_GROUP_ID_KEY]
+        db_session = session()
+        new_entry = EnergyAccountModel(
+            tg_user_id=message.from_user.id,
+            audit_tg_username=message.from_user.username,
+            tg_group_id=selected_group_id,
+            audit_tg_group_name=next(
+                (
+                    group_name
+                    for group_name, group_id in chat_data_context[
+                        SELECTABLE_GROUPS_KEY
+                    ].items()
+                    if group_id == selected_group_id
+                ),
+                None,
+            ),
+            hours_logged=None,  # TODO: pull this value out from chatgpt summarization and manage it independently.
+            description=summary,
+            timestamp=datetime.now(),
+        )
+        db_session.add(new_entry)
         await context.bot.send_message(
             chat_id=selected_group_id,
             message_thread_id=allowed_groups[selected_group_id],
             text=summary,
         )
+        await message.reply_text(text="Energy accounted. Thank you for your work!")
+        db_session.commit()
+        db_session.close()
 
         clear_conversation_context(context)
         return ConversationHandler.END
@@ -427,7 +475,10 @@ def railway_dns_workaround():
 
 
 def main(
-    open_ai_api_key: str, telegram_bot_token: str, allowed_groups: TelegramGroupIdLookup
+    open_ai_api_key: str,
+    telegram_bot_token: str,
+    allowed_groups: TelegramGroupIdLookup,
+    session: sessionmaker,
 ) -> None:
     """Run the bot."""
     railway_dns_workaround()
@@ -452,7 +503,7 @@ def main(
             ],
             CONFIRM_OR_EDIT: [
                 MessageHandler(
-                    filters.Regex("^(Yes)$"), handle_confirm(allowed_groups)
+                    filters.Regex("^(Yes)$"), handle_confirm(allowed_groups, session)
                 ),
                 MessageHandler(filters.Regex("^(No)$"), handle_edit),
             ],
@@ -476,18 +527,25 @@ if __name__ == "__main__":
     open_ai_api_key = os.getenv("OPEN_AI_API_KEY")
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     environment_name = os.getenv("RAILWAY_ENVIRONMENT_NAME")
+    database_url = os.getenv("DATABASE_URL")
     if (
         open_ai_api_key is None
         or telegram_bot_token is None
         or environment_name is None
+        or database_url is None
     ):
         logging.warning(
-            "Exiting -- you are missing env values for your environment name (needed to resolve group membership checks) Open AI api key and/or Telegram bot token."
+            "Exiting -- you are missing env values for your, database url, environment name (needed to resolve group membership checks) Open AI api key and/or Telegram bot token."
         )
     else:
+        engine = create_engine(database_url)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+
+        logging.info(f"Starting bot for environment {environment_name}.")
         allowed_groups = (
             PRODUCTION_GROUPS
             if environment_name == PRODUCTION_ENV_NAME
             else DEVELOPMENT_GROUPS
         )
-        main(open_ai_api_key, telegram_bot_token, allowed_groups)
+        main(open_ai_api_key, telegram_bot_token, allowed_groups, Session)

@@ -1,0 +1,20 @@
+version: "3"
+
+services:
+  app:
+    build: .
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://localuser:localpassword@db/local-energy-accounting-db
+    volumes:
+      - ./:/app
+
+  db:
+    image: postgres:latest
+    environment:
+      - POSTGRES_USER=localuser
+      - POSTGRES_PASSWORD=localpassword
+      - POSTGRES_DB=local-energy-accounting-db
