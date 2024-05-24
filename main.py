@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Coroutine, List, Optional
@@ -822,6 +823,9 @@ def main(
 
 
 if __name__ == "__main__":
+    time.sleep(
+        3
+    )  # workaround for railway private networking delay: https://docs.railway.app/guides/private-networking#initialization-time
     load_dotenv()
     open_ai_api_key = os.getenv("OPEN_AI_API_KEY")
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
