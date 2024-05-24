@@ -1,27 +1,26 @@
+import json
 import logging
-from datetime import datetime
-from dotenv import load_dotenv
 import os
 import re
-import json
-import requests
+import uuid
+from datetime import datetime
 from typing import Any, Callable, Coroutine, List, Optional
 
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 from sqlalchemy import (
-    ForeignKey,
-    create_engine,
+    BigInteger,
     Column,
-    Integer,
-    String,
-    Float,
     DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    String,
+    create_engine,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import Index
-from sqlalchemy.orm import sessionmaker, declarative_base
-import uuid
-
-from openai import OpenAI
+from sqlalchemy.orm import declarative_base, sessionmaker
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -100,7 +99,10 @@ class EnergyAccountDTO:
         return f"""*Contributor:* {self.audit_tg_user_name}
 *Date*: {self.timestamp}
 
-*Contributions*
+{self.present_for_editing()}"""
+
+    def present_for_editing(self) -> str:
+        return f"""*Contributions*
 {self.__present_tasks()}
 
 *Hours*: {self.hours} hours"""
@@ -109,11 +111,11 @@ class EnergyAccountDTO:
 class EnergyAccountModel(Base):
     __tablename__ = "energy_accounts"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tg_user_id = Column(Integer)
-    audit_tg_name = Column(
+    tg_user_id = Column(BigInteger)
+    audit_tg_user_name = Column(
         String
     )  # per python-telegram-bot's API, this value is f"@{username}" if `username` is available, and `full_name` otherwise.
-    tg_group_id = Column(Integer)
+    tg_group_id = Column(BigInteger)
     audit_tg_group_name = Column(String)
     hours = Column(Float)
     timestamp = Column(DateTime)
@@ -127,7 +129,7 @@ class EnergyAccountModel(Base):
     def from_dto(cls, dto: EnergyAccountDTO) -> "EnergyAccountModel":
         return EnergyAccountModel(
             tg_user_id=dto.tg_user_id,
-            audit_tg_name=dto.audit_tg_user_name,
+            audit_tg_user_name=dto.audit_tg_user_name,
             tg_group_id=dto.tg_group_id,
             audit_tg_group_name=dto.audit_tg_group_name,
             hours=dto.hours,
@@ -146,6 +148,7 @@ class TaskModel(Base):
         return TaskModel(
             energy_account_id=energy_account_id, description=task_dto.description
         )
+
 
 async def handle_uninitialized_voice_text_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -366,7 +369,7 @@ def new_from_voice(
 
         if hours is None:
             await message.reply_text(
-                f"""Don't think you said anything about how many hours you spent there. How many was that?
+                """Don't think you said anything about how many hours you spent there. How many was that?
 Please just input the (positive!) number and nothing else.
 
 That is, DO:
@@ -438,6 +441,15 @@ def new_from_text(
             datetime.now(),
         )
         task_hours_summarized_dict = json.loads(llm_output_json_string)
+        # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
+        if (
+            JSON_OUTPUT_HOURS_KEY not in task_hours_summarized_dict
+            or JSON_OUTPUT_HOURS_KEY not in task_hours_summarized_dict
+        ):
+            await message.reply_text(
+                "I couldn't identify any meaningful tasks to summarize. Could you tell me again, please? It might help me if you rephrase a little bit."
+            )
+            return AWAITING_RAW_INPUT
         hours = task_hours_summarized_dict[JSON_OUTPUT_HOURS_KEY]
         tasks_json = task_hours_summarized_dict[JSON_OUTPUT_TASKS_KEY]
         # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
@@ -460,18 +472,9 @@ def new_from_text(
 
         if hours is None:
             await message.reply_text(
-                f"""Don't think you said anything about how many hours you spent there. How many was that?
-Please just input the (positive!) number and nothing else.
+                """Don't think you said anything about how many hours you spent there. How many was that?
 
-That is, DO:
-3
-15.5
-18.7
-
-NOT:
-3 hours
--1hr
-8 hours and 5 minutes"""
+Please just input the (positive!) number and nothing else."""
             )
             add_summary_to_context(new_energy_account, context)
             return AWAITING_HOURS_INPUT
@@ -484,31 +487,29 @@ NOT:
 
     return decorated_handler
 
+
 async def backfilling_hours_handler(
-        update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> int:
-    number_only_regex = r'^\d+(\.\d+)?$'
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    number_only_regex = r"^\d+(\.\d+)?$"
     if re.match(number_only_regex, update.message.text):
-        # parse the number and update energy account dto held in context with the new value 
+        # parse the number and update energy account dto held in context with the new value
         energy_account = context.chat_data[ENTRY_BEING_CREATED_KEY]
         energy_account.hours = float(update.message.text)
+        add_summary_to_context(energy_account, context)
+        await send_summary_confirmation_message(update.message, energy_account)
         return CONFIRM_OR_EDIT
     await update.message.reply_text(
-    f"""That didn't make sense to me.
+        """That didn't make sense to me.
 
-Again, DO:
-3
-15.5
-18.7
-
-NOT:
-3 hours
--1hr
-8 hours and 5 minutes"""
+Please input the hour count and nothing else (e.g. 3, 15.5, 18.7 would work, "3 hours", "- 15", or "8 hours and 5 minutes" would not)."""
     )
     return AWAITING_HOURS_INPUT
 
-async def send_summary_confirmation_message(message: Message, new_energy_account: EnergyAccountDTO):
+
+async def send_summary_confirmation_message(
+    message: Message, new_energy_account: EnergyAccountDTO
+):
     reply_keyboard = [["Yes"], ["No"]]
 
     await message.reply_text(
@@ -580,7 +581,9 @@ If you weren't able to identify any meaningful tasks to summarize, DO NOT output
     return completion.choices[0].message.content
 
 
-def add_summary_to_context(summary: EnergyAccountDTO, context: ContextTypes.DEFAULT_TYPE):
+def add_summary_to_context(
+    summary: EnergyAccountDTO, context: ContextTypes.DEFAULT_TYPE
+):
     chat_data_context = context.chat_data
     if chat_data_context is None:
         logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
@@ -611,19 +614,26 @@ def handle_confirm(
         if not message:
             return AWAITING_RAW_INPUT
 
-        energy_account_dto: EnergyAccountDTO = context.chat_data[ENTRY_BEING_CREATED_KEY]
+        energy_account_dto: EnergyAccountDTO = context.chat_data[
+            ENTRY_BEING_CREATED_KEY
+        ]
         db_session = session()
-        created_energy_account_db_model = EnergyAccountModel.from_dto(energy_account_dto)
+        created_energy_account_db_model = EnergyAccountModel.from_dto(
+            energy_account_dto
+        )
         db_session.add(created_energy_account_db_model)
         db_session.flush()
 
-        task_db_models = [ TaskModel.from_dto(dto, created_energy_account_db_model.id) for dto in energy_account_dto.tasks ]
+        task_db_models = [
+            TaskModel.from_dto(dto, created_energy_account_db_model.id)
+            for dto in energy_account_dto.tasks
+        ]
         db_session.add_all(task_db_models)
 
         await context.bot.send_message(
-            chat_id=selected_group_id,
-            message_thread_id=allowed_groups[selected_group_id],
-            text=summary,
+            chat_id=energy_account_dto.tg_group_id,
+            message_thread_id=allowed_groups[energy_account_dto.tg_group_id],
+            text=energy_account_dto.present(),
         )
         await message.reply_text(
             text="Energy accounted. Thank you for your work!",
@@ -643,8 +653,8 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if chat_data_context is None:
         logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
         return AWAITING_RAW_INPUT
-    summary: str = chat_data_context[ENTRY_BEING_CREATED]
-    if not summary:
+    new_account_dto: EnergyAccountDTO = chat_data_context[ENTRY_BEING_CREATED_KEY]
+    if not new_account_dto:
         logging.warning(
             "handle-confirm step does not have a summmary to use from context!"
         )
@@ -658,7 +668,7 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 You can paste in the following to start (please follow the format!):
         """
     )
-    await message.reply_text(text=summary)
+    await message.reply_text(text=new_account_dto.present_for_editing())
     return EDITING_RAW
 
 
@@ -671,8 +681,45 @@ async def handle_edit_raw_input(
     edited_raw = message.text
     if not edited_raw:
         return AWAITING_RAW_INPUT
-    await send_summary_confirmation_message(message, edited_raw)
-    return CONFIRM_OR_EDIT
+    pattern = r"\*Contributions\*\n(- .+\n)+\n\*Hours\*: (\d+(\.\d+)?) hours"
+    match = re.search(pattern, edited_raw)
+    if match:
+        chat_data_context = context.chat_data
+        if chat_data_context is None:
+            logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
+            return AWAITING_RAW_INPUT
+        being_edited_account_dto: EnergyAccountDTO = chat_data_context[
+            ENTRY_BEING_CREATED_KEY
+        ]
+
+        task_descriptions = [
+            line.strip("- ") for line in match.group(0).split("\n")[1:-2]
+        ]
+
+        edited_tasks_parsed: List[TaskDTO] = []
+        for task_description in task_descriptions:
+            trimmed = task_description.strip()
+            if trimmed == "":
+                continue
+            task_parsed = TaskDTO(trimmed)
+            edited_tasks_parsed.append(task_parsed)
+
+        being_edited_account_dto.tasks = edited_tasks_parsed
+        hours = float(match.group(2))
+        being_edited_account_dto.hours = hours
+        await send_summary_confirmation_message(message, being_edited_account_dto)
+        return CONFIRM_OR_EDIT
+    await message.reply_text(
+        text="""I don't really understand this. Please make sure your edit follows the following format:
+*Contributions*
+- <<Task description>>
+- <<Task description>>
+- <<Task description>>
+<<... any number hyphen-delimited task descriptions>>
+
+*Hours*: <<Number, possibly with a decimal place>> hours"""
+    )
+    return EDITING_RAW
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -752,10 +799,8 @@ def main(
                 MessageHandler(filters.VOICE, new_from_voice_handler),
             ],
             AWAITING_HOURS_INPUT: [
-                MessageHandler(
-                    filters.TEXT, backfilling_hours_handler
-                ),
-            ]
+                MessageHandler(filters.TEXT, backfilling_hours_handler),
+            ],
             CONFIRM_OR_EDIT: [
                 MessageHandler(
                     filters.Regex("^(Yes)$"), handle_confirm(allowed_groups, session)
