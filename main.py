@@ -348,9 +348,17 @@ def new_from_voice(
             datetime.now(),
         )
         task_hours_summarized_dict = json.loads(llm_output_json_string)
+        # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
+        if (
+            JSON_OUTPUT_HOURS_KEY not in task_hours_summarized_dict
+            or JSON_OUTPUT_HOURS_KEY not in task_hours_summarized_dict
+        ):
+            await message.reply_text(
+                "I couldn't identify any meaningful tasks to summarize. Could you tell me again, please? It might help me if you rephrase a little bit."
+            )
+            return AWAITING_RAW_INPUT
         hours = task_hours_summarized_dict[JSON_OUTPUT_HOURS_KEY]
         tasks_json = task_hours_summarized_dict[JSON_OUTPUT_TASKS_KEY]
-        # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
         if tasks_json is None or len(tasks_json) == 0:
             await message.reply_text(
                 "I couldn't identify any meaningful tasks to summarize. Could you tell me again, please? It might help me if you rephrase a little bit."
@@ -559,16 +567,14 @@ Please extract from it the following information:
 
 Format output as a well-formed JSON object per the following schema:
 
-```json
 {{
-    {JSON_OUTPUT_HOURS_KEY}: N,
-    {JSON_OUTPUT_TASKS_KEY}: [
-        {{{JSON_OUTPUT_DESCRIPTION_KEY}: key_point_1 }},
-        {{{JSON_OUTPUT_DESCRIPTION_KEY}: key_point_2 }},
+    "{JSON_OUTPUT_HOURS_KEY}": N,
+    "{JSON_OUTPUT_TASKS_KEY}": [
+        {{"{JSON_OUTPUT_DESCRIPTION_KEY}": key_point_1 }},
+        {{"{JSON_OUTPUT_DESCRIPTION_KEY}": key_point_2 }},
         ...
     ],
 }}
-```
 
 If you weren't able to identify any meaningful tasks to summarize, DO NOT output a default placeholder reply prompting the user to give you input. Instead, just return the empty JSON object, `{{}}`.
 """
