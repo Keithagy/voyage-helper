@@ -158,13 +158,13 @@ async def handle_uninitialized_voice_text_input(
         return ConversationHandler.END
 
     if message.chat.type != "private":
-        bot_link = f"https://t.me/{context.bot.username}"
-        keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await message.reply_text(
-            f"{message.from_user.name}, are you trying to log a new energy account? This channel should be for announcements only. Please click the button below to open our private chat, then try again with /start. Thank you!",
-            reply_markup=reply_markup,
-        )
+        # bot_link = f"https://t.me/{context.bot.username}"
+        # keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
+        # reply_markup = InlineKeyboardMarkup(keyboard)
+        # await message.reply_text(
+        #     f"{message.from_user.name}, are you trying to log a new energy account? This channel should be for announcements only. Please click the button below to open our private chat, then try again with /start. Thank you!",
+        #     reply_markup=reply_markup,
+        # )
         return ConversationHandler.END
 
     await message.reply_text(
