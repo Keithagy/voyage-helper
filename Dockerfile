@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 8000
 
 # Specify the command to run the application
-CMD sleep 3 && python main.py
+CMD ["python", "main.py"]
