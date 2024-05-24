@@ -2,10 +2,20 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+import re
+import json
 import requests
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, List, Optional
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import (
+    ForeignKey,
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Index
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -40,24 +50,72 @@ logging.getLogger("httpx").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
-AWAITING_GROUP_SELECTION, AWAITING_RAW_INPUT, CONFIRM_OR_EDIT, EDITING_RAW = range(4)
-SUMMARIZED_ENTRY_KEY = "summarized_entry"
-SELECTED_GROUP_ID_KEY = "selected_group_id"
-SELECTABLE_GROUPS_KEY = "selectable_groups"
+(
+    AWAITING_GROUP_SELECTION,
+    AWAITING_RAW_INPUT,
+    AWAITING_HOURS_INPUT,
+    CONFIRM_OR_EDIT,
+    EDITING_RAW,
+) = range(5)
+ENTRY_BEING_CREATED_KEY = "entry_being_created"  # Value should be an instance of `EnergyAccountDTO`, representing the energy account being incrementally built over the bot's /start flow
+SELECTED_GROUP_KEY = "selected_group"  # Value should be a tuple representing (group_id, group_name); MAINTAINABILITY NOTE, this kind of context-dependent nullability is where python starts to show its lack, and something like rust starts to become very attractive.
+SELECTABLE_GROUPS_KEY = "selectable_groups"  # Value should be a dict of (group_name, group_id) to facilitate selection
 PRODUCTION_ENV_NAME = "production"
 
 Base = declarative_base()
+
+
+class TaskDTO:
+    def __init__(self, description: str):
+        self.description = description
+
+    def present(self) -> str:
+        return f"- {self.description}"
+
+
+class EnergyAccountDTO:
+    def __init__(
+        self,
+        tg_user_id: int,
+        audit_tg_user_name: str,
+        tg_group_id: int,
+        audit_tg_group_name: str,
+        hours: float,
+        tasks: List[TaskDTO],
+        timestamp: datetime,
+    ):
+        self.tg_user_id = tg_user_id
+        self.audit_tg_user_name = audit_tg_user_name
+        self.tg_group_id = tg_group_id
+        self.audit_tg_group_name = audit_tg_group_name
+        self.hours = hours
+        self.tasks = tasks
+        self.timestamp = timestamp
+
+    def __present_tasks(self) -> str:
+        task_strings = [task.present() for task in self.tasks]
+        return "\n".join(task_strings)
+
+    def present(self) -> str:
+        return f"""*Contributor:* {self.audit_tg_user_name}
+*Date*: {self.timestamp}
+
+*Contributions*
+{self.__present_tasks()}
+
+*Hours*: {self.hours} hours"""
 
 
 class EnergyAccountModel(Base):
     __tablename__ = "energy_accounts"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tg_user_id = Column(Integer)
-    audit_tg_username = Column(String)
+    audit_tg_name = Column(
+        String
+    )  # per python-telegram-bot's API, this value is f"@{username}" if `username` is available, and `full_name` otherwise.
     tg_group_id = Column(Integer)
     audit_tg_group_name = Column(String)
-    hours_logged = Column(Float)
-    description = Column(String)
+    hours = Column(Float)
     timestamp = Column(DateTime)
 
     __table_args__ = (
@@ -65,6 +123,29 @@ class EnergyAccountModel(Base):
         Index("idx_tg_group_id", tg_group_id),
     )
 
+    @classmethod
+    def from_dto(cls, dto: EnergyAccountDTO) -> "EnergyAccountModel":
+        return EnergyAccountModel(
+            tg_user_id=dto.tg_user_id,
+            audit_tg_name=dto.audit_tg_user_name,
+            tg_group_id=dto.tg_group_id,
+            audit_tg_group_name=dto.audit_tg_group_name,
+            hours=dto.hours,
+            timestamp=dto.timestamp,
+        )
+
+
+class TaskModel(Base):
+    __tablename__ = "tasks"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    energy_account_id = Column(UUID(as_uuid=True), ForeignKey("energy_accounts.id"))
+    description = Column(String)
+
+    @classmethod
+    def from_dto(cls, task_dto: TaskDTO, energy_account_id: UUID) -> "TaskModel":
+        return TaskModel(
+            energy_account_id=energy_account_id, description=task_dto.description
+        )
 
 async def handle_uninitialized_voice_text_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -84,7 +165,8 @@ async def handle_uninitialized_voice_text_input(
         return ConversationHandler.END
 
     await message.reply_text(
-        f"Hi {message.from_user.name}, please /start me first. Thank you!"
+        f"Hi {message.from_user.name}, please /start me first. Thank you!",
+        reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
 
@@ -128,19 +210,24 @@ def start(
             await message.reply_text(
                 "It appears you haven't yet been added into any Telegram channels for an Astralship voyage. "
                 "Please come back after that has happened! Reach out to a member of Astralship crew for help here. "
-                "Later!"
+                "Later!",
+                reply_markup=ReplyKeyboardRemove(),
             )
             return ConversationHandler.END
 
         if len(group_ids_accessible_for_user) == 1:
+            lone_chat = await context.bot.get_chat(group_ids_accessible_for_user[0])
             await message.reply_text(
-                f"You're part of just the one Astralship telegram channel ({( await context.bot.get_chat(group_ids_accessible_for_user[0]) ).effective_name}), so I'll take it that you're doing energy accounting for that. "
+                f"You're part of just the one Astralship telegram channel ({lone_chat.effective_name}), so I'll take it that you're doing energy accounting for that. "
                 "Whenever you're ready, tell me via voice or text what you did today and how much time it took."
             )
             context_chat_data = context.chat_data
             if context_chat_data is None:
                 return AWAITING_RAW_INPUT
-            context_chat_data[SELECTED_GROUP_ID_KEY] = group_ids_accessible_for_user[0]
+            context_chat_data[SELECTED_GROUP_KEY] = (
+                lone_chat.id,
+                lone_chat.effective_name,
+            )
             return AWAITING_RAW_INPUT
 
         groups = {
@@ -197,7 +284,7 @@ async def handle_group_selection(
         return AWAITING_GROUP_SELECTION
 
     selected_group_id = selectable_groups[selection]
-    context_chat_data[SELECTED_GROUP_ID_KEY] = selected_group_id
+    context_chat_data[SELECTED_GROUP_KEY] = (selected_group_id, selection)
 
     await update.message.reply_text(
         f"Ok, creating an energy accounting entry for {selection}.\n"
@@ -234,18 +321,71 @@ def new_from_voice(
             logging.warning("SHOULD HAVE USER FOR NEW FROM VOICE")
             return AWAITING_RAW_INPUT
 
-        summary = await summarize_prose(transcript, open_ai_client)
-        if not summary:
+        llm_output_json_string = await summarize_prose(transcript, open_ai_client)
+        if llm_output_json_string is None:
             await message.reply_text(
                 "I wasn't able to summarize your input. Could you try again (or send the send the same message again, if you don't wish to change anything about it) please?"
             )
             return AWAITING_RAW_INPUT
-        summary_headers_added = f"""*Contributor:* @{user.username}
-*Date*: {datetime.now()}
 
-{summary}"""
-        add_summary_to_context(summary_headers_added, context)
-        await send_summary_confirmation_message(message, summary_headers_added)
+        chat_data_context = context.chat_data
+        if chat_data_context is None:
+            logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
+            return ConversationHandler.END
+
+        (selected_group_id, selected_group_name) = chat_data_context[SELECTED_GROUP_KEY]
+        new_energy_account = EnergyAccountDTO(
+            message.from_user.id,
+            message.from_user.name,
+            selected_group_id,
+            selected_group_name,
+            None,
+            None,
+            datetime.now(),
+        )
+        task_hours_summarized_dict = json.loads(llm_output_json_string)
+        hours = task_hours_summarized_dict[JSON_OUTPUT_HOURS_KEY]
+        tasks_json = task_hours_summarized_dict[JSON_OUTPUT_TASKS_KEY]
+        # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
+        if tasks_json is None or len(tasks_json) == 0:
+            await message.reply_text(
+                "I couldn't identify any meaningful tasks to summarize. Could you tell me again, please? It might help me if you rephrase a little bit."
+            )
+            return AWAITING_RAW_INPUT
+
+        # Iterate through model output for tasks to parse into code-friendly structure
+        tasks_parsed: List[TaskDTO] = []
+        for task_json in tasks_json:
+            task_description = task_json[JSON_OUTPUT_DESCRIPTION_KEY]
+            if task_description is None or task_description == "":
+                logging.error("PROMPT IS GENERATING EMPTY TASK DESCRIPTIONS")
+                continue
+            task_parsed = TaskDTO(task_description)
+            tasks_parsed.append(task_parsed)
+        new_energy_account.tasks = tasks_parsed
+
+        if hours is None:
+            await message.reply_text(
+                f"""Don't think you said anything about how many hours you spent there. How many was that?
+Please just input the (positive!) number and nothing else.
+
+That is, DO:
+3
+15.5
+18.7
+
+NOT:
+3 hours
+-1hr
+8 hours and 5 minutes"""
+            )
+            add_summary_to_context(new_energy_account, context)
+            return AWAITING_HOURS_INPUT
+        new_energy_account.hours = hours
+
+        add_summary_to_context(new_energy_account, context)
+        await send_summary_confirmation_message(message, new_energy_account)
+
         return CONFIRM_OR_EDIT
 
     return decorated_handler
@@ -275,32 +415,106 @@ def new_from_text(
             logging.warning("SHOULD HAVE USER FOR NEW FROM VOICE")
             return AWAITING_RAW_INPUT
 
-        summary = await summarize_prose(input, open_ai_client)
-        if not summary:
+        llm_output_json_string = await summarize_prose(input, open_ai_client)
+        if llm_output_json_string is None:
             await message.reply_text(
                 "I wasn't able to summarize your input. Could you try again (or send the send the same message again, if you don't wish to change anything about it) please?"
             )
             return AWAITING_RAW_INPUT
 
-        summary_headers_added = f"""*Contributor:* @{user.username}
-*Date*: {datetime.now()}
+        chat_data_context = context.chat_data
+        if chat_data_context is None:
+            logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
+            return ConversationHandler.END
 
-{summary}"""
-        add_summary_to_context(summary_headers_added, context)
-        await send_summary_confirmation_message(message, summary_headers_added)
+        (selected_group_id, selected_group_name) = chat_data_context[SELECTED_GROUP_KEY]
+        new_energy_account = EnergyAccountDTO(
+            message.from_user.id,
+            message.from_user.name,
+            selected_group_id,
+            selected_group_name,
+            None,
+            None,
+            datetime.now(),
+        )
+        task_hours_summarized_dict = json.loads(llm_output_json_string)
+        hours = task_hours_summarized_dict[JSON_OUTPUT_HOURS_KEY]
+        tasks_json = task_hours_summarized_dict[JSON_OUTPUT_TASKS_KEY]
+        # Read `summarize_prose` for more information how wonky-prompt edge cases get handled.
+        if tasks_json is None or len(tasks_json) == 0:
+            await message.reply_text(
+                "I couldn't identify any meaningful tasks to summarize. Could you tell me again, please? It might help me if you rephrase a little bit."
+            )
+            return AWAITING_RAW_INPUT
+
+        # Iterate through model output for tasks to parse into code-friendly structure
+        tasks_parsed: List[TaskDTO] = []
+        for task_json in tasks_json:
+            task_description = task_json[JSON_OUTPUT_DESCRIPTION_KEY]
+            if task_description is None or task_description == "":
+                logging.error("PROMPT IS GENERATING EMPTY TASK DESCRIPTIONS")
+                continue
+            task_parsed = TaskDTO(task_description)
+            tasks_parsed.append(task_parsed)
+        new_energy_account.tasks = tasks_parsed
+
+        if hours is None:
+            await message.reply_text(
+                f"""Don't think you said anything about how many hours you spent there. How many was that?
+Please just input the (positive!) number and nothing else.
+
+That is, DO:
+3
+15.5
+18.7
+
+NOT:
+3 hours
+-1hr
+8 hours and 5 minutes"""
+            )
+            add_summary_to_context(new_energy_account, context)
+            return AWAITING_HOURS_INPUT
+        new_energy_account.hours = hours
+
+        add_summary_to_context(new_energy_account, context)
+        await send_summary_confirmation_message(message, new_energy_account)
 
         return CONFIRM_OR_EDIT
 
     return decorated_handler
 
+async def backfilling_hours_handler(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+    number_only_regex = r'^\d+(\.\d+)?$'
+    if re.match(number_only_regex, update.message.text):
+        # parse the number and update energy account dto held in context with the new value 
+        energy_account = context.chat_data[ENTRY_BEING_CREATED_KEY]
+        energy_account.hours = float(update.message.text)
+        return CONFIRM_OR_EDIT
+    await update.message.reply_text(
+    f"""That didn't make sense to me.
 
-async def send_summary_confirmation_message(message: Message, summary: str):
+Again, DO:
+3
+15.5
+18.7
+
+NOT:
+3 hours
+-1hr
+8 hours and 5 minutes"""
+    )
+    return AWAITING_HOURS_INPUT
+
+async def send_summary_confirmation_message(message: Message, new_energy_account: EnergyAccountDTO):
     reply_keyboard = [["Yes"], ["No"]]
 
     await message.reply_text(
         text=f"""Here's what I got:
 
-{summary}
+{new_energy_account.present()}
 
 Was that right?
             """,
@@ -310,6 +524,11 @@ Was that right?
             input_field_placeholder="Is this summary accurate?",
         ),
     )
+
+
+JSON_OUTPUT_HOURS_KEY = "hours"
+JSON_OUTPUT_TASKS_KEY = "tasks"
+JSON_OUTPUT_DESCRIPTION_KEY = "description"
 
 
 async def generate_transcript(audio_file_path: str, open_ai_client: OpenAI) -> str:
@@ -328,24 +547,29 @@ async def generate_transcript(audio_file_path: str, open_ai_client: OpenAI) -> s
 
 
 async def summarize_prose(transcript: str, open_ai_client: OpenAI) -> Optional[str]:
-    system_prompt = """
-You are a task completion log summarizer.
+    system_prompt = f"""
+You are a producer of JSON objects representing task completion accounting entries.
 The user will send you a transcript of a voice note outlining contributions from a team member, to be summarized and presented as a concise, clear bullet point list. 
 
 Please extract from it the following information:
-1. `N`, the number of hours worked. If there is no reference to time spent working, N should be set to Null. Otherwise, try to infer the amount of hours.
+1. `N`, the number of hours worked. If there is no reference to time spent working, N should be null. Otherwise, try to infer the amount of hours.
 2. `key_point_1`, `key_point_2`, `...`, the summarized list of contributions described by the team member. Be sure to include the project(s) that the contribution comes under, as well as names of any collaborators mentioned.
 
-Format output per the following structure:
+Format output as a well-formed JSON object per the following schema:
 
-*Contributions:*
-- `key_point_1`
-- `key_point_2`
-- `...`
+```json
+{{
+    {JSON_OUTPUT_HOURS_KEY}: N,
+    {JSON_OUTPUT_TASKS_KEY}: [
+        {{{JSON_OUTPUT_DESCRIPTION_KEY}: key_point_1 }},
+        {{{JSON_OUTPUT_DESCRIPTION_KEY}: key_point_2 }},
+        ...
+    ],
+}}
+```
 
-*Hours:* `N` hours
+If you weren't able to identify any meaningful tasks to summarize, DO NOT output a default placeholder reply prompting the user to give you input. Instead, just return the empty JSON object, `{{}}`.
 """
-
     completion = open_ai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -353,16 +577,15 @@ Format output per the following structure:
             {"role": "user", "content": transcript},
         ],
     )
-
     return completion.choices[0].message.content
 
 
-def add_summary_to_context(summary: str, context: ContextTypes.DEFAULT_TYPE):
+def add_summary_to_context(summary: EnergyAccountDTO, context: ContextTypes.DEFAULT_TYPE):
     chat_data_context = context.chat_data
     if chat_data_context is None:
         logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
         return
-    chat_data_context[SUMMARIZED_ENTRY_KEY] = summary
+    chat_data_context[ENTRY_BEING_CREATED_KEY] = summary
 
 
 def handle_confirm(
@@ -377,7 +600,7 @@ def handle_confirm(
         if chat_data_context is None:
             logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
             return AWAITING_RAW_INPUT
-        summary: str = chat_data_context[SUMMARIZED_ENTRY_KEY]
+        summary: EnergyAccountDTO = chat_data_context[ENTRY_BEING_CREATED_KEY]
         if not summary:
             logging.warning(
                 "handle-confirm step does not have a summmary to use from context!"
@@ -388,33 +611,24 @@ def handle_confirm(
         if not message:
             return AWAITING_RAW_INPUT
 
-        selected_group_id = chat_data_context[SELECTED_GROUP_ID_KEY]
+        energy_account_dto: EnergyAccountDTO = context.chat_data[ENTRY_BEING_CREATED_KEY]
         db_session = session()
-        new_entry = EnergyAccountModel(
-            tg_user_id=message.from_user.id,
-            audit_tg_username=message.from_user.username,
-            tg_group_id=selected_group_id,
-            audit_tg_group_name=next(
-                (
-                    group_name
-                    for group_name, group_id in chat_data_context[
-                        SELECTABLE_GROUPS_KEY
-                    ].items()
-                    if group_id == selected_group_id
-                ),
-                None,
-            ),
-            hours_logged=None,  # TODO: pull this value out from chatgpt summarization and manage it independently.
-            description=summary,
-            timestamp=datetime.now(),
-        )
-        db_session.add(new_entry)
+        created_energy_account_db_model = EnergyAccountModel.from_dto(energy_account_dto)
+        db_session.add(created_energy_account_db_model)
+        db_session.flush()
+
+        task_db_models = [ TaskModel.from_dto(dto, created_energy_account_db_model.id) for dto in energy_account_dto.tasks ]
+        db_session.add_all(task_db_models)
+
         await context.bot.send_message(
             chat_id=selected_group_id,
             message_thread_id=allowed_groups[selected_group_id],
             text=summary,
         )
-        await message.reply_text(text="Energy accounted. Thank you for your work!")
+        await message.reply_text(
+            text="Energy accounted. Thank you for your work!",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         db_session.commit()
         db_session.close()
 
@@ -429,7 +643,7 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if chat_data_context is None:
         logging.warning("CONTEXT SHOULD NOT BE MISSING `chat_data`")
         return AWAITING_RAW_INPUT
-    summary: str = chat_data_context[SUMMARIZED_ENTRY_KEY]
+    summary: str = chat_data_context[ENTRY_BEING_CREATED]
     if not summary:
         logging.warning(
             "handle-confirm step does not have a summmary to use from context!"
@@ -464,7 +678,7 @@ async def handle_edit_raw_input(
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
     user = update.message.from_user
-    logger.info("User %s canceled the conversation.", user.first_name)
+    logger.info("User %s canceled the conversation.", user.name)
     clear_conversation_context(context)
     await update.message.reply_text(
         "Bye! I hope we can talk again some day.", reply_markup=ReplyKeyboardRemove()
@@ -537,6 +751,11 @@ def main(
                 ),
                 MessageHandler(filters.VOICE, new_from_voice_handler),
             ],
+            AWAITING_HOURS_INPUT: [
+                MessageHandler(
+                    filters.TEXT, backfilling_hours_handler
+                ),
+            ]
             CONFIRM_OR_EDIT: [
                 MessageHandler(
                     filters.Regex("^(Yes)$"), handle_confirm(allowed_groups, session)

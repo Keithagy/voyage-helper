@@ -10,15 +10,17 @@ class TelegramGroupIdentifier:
         self.group_id = group_id
         self.message_thread_id = message_thread_id
 
+
 TelegramGroupId = int
-TelegramMessageThreadId = int # indicates which topic in a given Telegram supergroup the bot should blast completed energy accounts out to. 
+TelegramMessageThreadId = int  # indicates which topic in a given Telegram supergroup the bot should blast completed energy accounts out to.
 TelegramGroupIdLookup = Dict[TelegramGroupId, TelegramMessageThreadId]
 
+# TODO: make use of telegram API to determine which group ids the bot should be aware of upon startup
 PRODUCTION_GROUPS: TelegramGroupIdLookup = {
-    -1002133514647: 136, # test channel
-    -1002075316483: 178 # phoenix crew
+    -1002133514647: 136,  # test channel
+    -1002075316483: 178,  # phoenix crew
 }
 
 DEVELOPMENT_GROUPS: TelegramGroupIdLookup = {
-    -1002133514647: 136, # test channel
+    -1002133514647: 136,  # test channel
 }

@@ -7,8 +7,6 @@ services:
       - db
     ports:
       - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://localuser:localpassword@db/local-energy-accounting-db
     volumes:
       - ./:/app
 
