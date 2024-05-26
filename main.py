@@ -2,9 +2,10 @@ import json
 import logging
 import os
 import re
-import time
+import time as os_time
 import uuid
-from datetime import datetime
+from datetime import datetime, time
+import pytz
 from typing import Any, Callable, Coroutine, List, Optional
 
 import requests
@@ -178,7 +179,7 @@ async def handle_uninitialized_voice_text_input(
 def start(
     allowed_groups: TelegramGroupIdLookup,
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
-    async def decorated_handler(
+    async def decorated_start_handler(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         """Starts the conversation and asks the user about their preferred start to the flow."""
@@ -259,7 +260,7 @@ def start(
         )
         return AWAITING_GROUP_SELECTION
 
-    return decorated_handler
+    return decorated_start_handler
 
 
 async def handle_group_selection(
@@ -302,7 +303,7 @@ def new_from_voice(
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
     """Handles user sending a voice message for their energy accounting entry"""
 
-    async def decorated_handler(
+    async def decorated_new_from_voice_handler(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         message = update.message
@@ -400,7 +401,7 @@ NOT:
 
         return CONFIRM_OR_EDIT
 
-    return decorated_handler
+    return decorated_new_from_voice_handler
 
 
 def new_from_text(
@@ -408,7 +409,7 @@ def new_from_text(
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
     """Handles user sending a text message for their energy accounting entry"""
 
-    async def decorated_handler(
+    async def decorated_new_from_text_handler(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         message = update.message
@@ -494,7 +495,7 @@ Please just input the (positive!) number and nothing else."""
 
         return CONFIRM_OR_EDIT
 
-    return decorated_handler
+    return decorated_new_from_text_handler
 
 
 async def backfilling_hours_handler(
@@ -603,7 +604,7 @@ def handle_confirm(
     session: sessionmaker,
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, int]]:
 
-    async def decorated_handler(
+    async def decorated_handle_confirm_handler(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         chat_data_context = context.chat_data
@@ -652,7 +653,7 @@ def handle_confirm(
         clear_conversation_context(context)
         return ConversationHandler.END
 
-    return decorated_handler
+    return decorated_handle_confirm_handler
 
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -765,6 +766,30 @@ def railway_dns_workaround():
     print("Failed to reach api.telegram.org after 3 attempts.")
 
 
+def create_energy_accounts_reminder(
+    allowed_groups: TelegramGroupIdLookup,
+) -> Callable[[ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]:
+    async def decorated_create_energy_accounts_reminder_handler(
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        logging.info("reminding users to create energy acccouts...")
+        relevant_group_ids = allowed_groups.keys()
+        for group_id in relevant_group_ids:
+            logging.info(f"Reminding group id f{group_id}")
+            bot_link = f"https://t.me/{context.bot.username}"
+            keyboard = [[InlineKeyboardButton("Start Private Chat", url=bot_link)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=group_id,
+                text="""Here's your friendly reminder to create your energy accounting logs if you haven't already for the day!
+
+/start me in our private chat.""",
+                reply_markup=reply_markup,
+            )
+
+    return decorated_create_energy_accounts_reminder_handler
+
+
 def main(
     open_ai_api_key: str,
     telegram_bot_token: str,
@@ -824,12 +849,29 @@ def main(
     )
     application.add_handler(conv_handler)
 
+    job_queue = application.job_queue
+    if job_queue is None:
+        logging.warning("APPLICATION JOB_QUEUE SHOULD NOT BE NONE")
+        return
+
+    # Every day at 6pm GMT+1, send a reminder to all users to create energy accounts.
+    # Each user should get a single private message only regardless of how many voyages they might be a part of.
+    # NOTE: would be important to be able to mark voyages as active or not.
+    # TODO: instead of a dumb reminder, it can show the user all tasks logged for that day and make sure it's correct.
+    create_energy_accounts_reminder_time = time(
+        18, 00, tzinfo=pytz.timezone("Europe/London")
+    )
+    job_queue.run_daily(
+        create_energy_accounts_reminder(allowed_groups),
+        time=create_energy_accounts_reminder_time,
+    )
+
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    time.sleep(
+    os_time.sleep(
         3
     )  # workaround for railway private networking delay: https://docs.railway.app/guides/private-networking#initialization-time
     load_dotenv()
