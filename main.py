@@ -4,7 +4,8 @@ import os
 import re
 import time as os_time
 import uuid
-from datetime import datetime, time
+import copy
+from datetime import datetime, time, timedelta
 import pytz
 from typing import Any, Callable, Coroutine, List, Optional
 
@@ -790,6 +791,36 @@ def create_energy_accounts_reminder(
     return decorated_create_energy_accounts_reminder_handler
 
 
+def generate_reports(
+    reporting_interval: timedelta,
+    allowed_groups: TelegramGroupIdLookup,
+    session: sessionmaker,
+) -> Callable[[ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]:
+    async def decorated_generate_reports_handler(
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        for group_id in allowed_groups.keys():
+            energy_accounts_created_in_reporting_interval_for_group: List[
+                EnergyAccountModel
+            ] = get_energy_accounts_created_in_reporting_interval_for_group(
+                reoprting_interval, group_id, session
+            )
+
+            # this model would already have been scoped to the voyage by virtue of the channel id, so we expect to index by user id
+            report = EnergyAccountingReport.generate_from_models(
+                energy_accounts_created_in_reporting_interval
+            )
+            await context.bot.send_message(
+                chat_id=group_id,
+                message_thread_id=allowed_groups[group_id],
+                text=report.present(),
+            )
+
+            update_charting_data(group_id, report)
+
+    return decorated_generate_reports_handler
+
+
 def main(
     open_ai_api_key: str,
     telegram_bot_token: str,
@@ -808,6 +839,7 @@ def main(
         .build()
     )
 
+    # Handle energy account creation with a llm-enabled multi-step conversation
     new_from_text_handler = new_from_text(open_ai_client)
     new_from_voice_handler = new_from_voice(open_ai_client)
     sending_text_or_voice_without_start_handler = MessageHandler(
@@ -854,16 +886,40 @@ def main(
         logging.warning("APPLICATION JOB_QUEUE SHOULD NOT BE NONE")
         return
 
+    timezone = pytz.timezone("Europe/London")
     # Every day at 6pm GMT+1, send a reminder to all users to create energy accounts.
     # Each user should get a single private message only regardless of how many voyages they might be a part of.
     # NOTE: would be important to be able to mark voyages as active or not.
     # TODO: instead of a dumb reminder, it can show the user all tasks logged for that day and make sure it's correct.
-    create_energy_accounts_reminder_time = time(
-        18, 00, tzinfo=pytz.timezone("Europe/London")
-    )
+    create_energy_accounts_reminder_time = time(18, 00, tzinfo=timezone)
     job_queue.run_daily(
         create_energy_accounts_reminder(allowed_groups),
         time=create_energy_accounts_reminder_time,
+    )
+
+    # Every week at 7pm GMT+1, summarize crew contributions for the week and update charts + blast out onto relevant channels.
+    report_generation_time = time(19, 0, tzinfo=timezone)
+    current_datetime = datetime.now(timezone)
+    REPORT_GEN_DAY_INT_REPR = 4  # friday, week starts from 0 on monday
+    DAYS_IN_WEEK = 7
+    days_until_report_gen = (
+        REPORT_GEN_DAY_INT_REPR - current_datetime.weekday()
+    ) % DAYS_IN_WEEK
+    if days_until_report_gen == 0 and current_datetime.time() > report_generation_time:
+        days_until_report_gen = DAYS_IN_WEEK
+    next_report_gen_day = current_datetime.date() + timedelta(
+        days=days_until_report_gen
+    )
+    next_report_gen_datetime = datetime.combine(
+        next_report_gen_day, report_generation_time, tzinfo=timezone
+    )
+    report_generation_interval = timedelta(weeks=1)
+    job_queue.run_repeating(
+        generate_reports(
+            copy.deepcopy(report_generation_interval), allowed_groups, session
+        ),
+        interval=report_generation_interval,
+        first=next_report_gen_datetime,
     )
 
     # Run the bot until the user presses Ctrl-C
