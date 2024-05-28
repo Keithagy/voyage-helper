@@ -207,7 +207,7 @@ class EnergyAccountingReport:
 {task_lines}
 *Hours*: {report_entry[2]} hours"""
             )
-        report_rows_display = "\n".join(report_rows)
+        report_rows_display = "\n\n".join(report_rows)
         return f"""It's been another week! Here's what all of us managed to get done:
 
 {report_rows_display}
