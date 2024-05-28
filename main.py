@@ -3,11 +3,12 @@ import logging
 import os
 import re
 import time as os_time
+from typing_extensions import Dict
 import uuid
 import copy
 from datetime import datetime, time, timedelta
 import pytz
-from typing import Any, Callable, Coroutine, List, Optional
+from typing import Any, Callable, Coroutine, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -71,6 +72,12 @@ class TaskDTO:
     def __init__(self, description: str):
         self.description = description
 
+    @classmethod
+    def from_db_model(cls, db_model: "TaskModel") -> "TaskDTO":
+        return TaskDTO(
+            description=db_model.description,
+        )
+
     def present(self) -> str:
         return f"- {self.description}"
 
@@ -93,6 +100,20 @@ class EnergyAccountDTO:
         self.hours = hours
         self.tasks = tasks
         self.timestamp = timestamp
+
+    @classmethod
+    def from_db_model(
+        cls, db_model: "EnergyAccountModel", tasks: List["TaskModel"]
+    ) -> "EnergyAccountDTO":
+        return EnergyAccountDTO(
+            tg_user_id=db_model.tg_user_id,
+            audit_tg_user_name=db_model.audit_tg_user_name,
+            tg_group_id=db_model.tg_group_id,
+            audit_tg_group_name=db_model.audit_tg_group_name,
+            hours=db_model.hours,
+            timestamp=db_model.timestamp,
+            tasks=[TaskDTO.from_db_model(dto) for dto in tasks],
+        )
 
     def __present_tasks(self) -> str:
         task_strings = [task.present() for task in self.tasks]
@@ -138,6 +159,61 @@ class EnergyAccountModel(Base):
             hours=dto.hours,
             timestamp=dto.timestamp,
         )
+
+
+class EnergyAccountingReport:
+    entries_by_user_id: Dict[int, List[EnergyAccountDTO]]
+
+    def __init__(self, energy_accounts_by_user_id: Dict[int, List[EnergyAccountDTO]]):
+        self.entries_by_user_id = energy_accounts_by_user_id
+
+    @classmethod
+    def from_dtos(cls, dtos: List[EnergyAccountDTO]) -> "EnergyAccountingReport":
+        # Reports would already be subsetted by group, but we have to subset further by user
+        energy_accounts_by_user_id: Dict[int, List[EnergyAccountDTO]] = {}
+        for energy_account in dtos:
+            user_id = energy_account.tg_user_id
+            if user_id in energy_accounts_by_user_id:
+                energy_accounts_by_user_id[user_id].append(energy_account)
+            else:
+                energy_accounts_by_user_id[user_id] = [energy_account]
+        return EnergyAccountingReport(
+            energy_accounts_by_user_id=energy_accounts_by_user_id
+        )
+
+    def present(self) -> str:
+        report_entries: List[Tuple[str, List[TaskDTO], float]] = (
+            []
+        )  # user display name, tasks, cumul. hours
+        for user_id in self.entries_by_user_id:
+            accounts_for_user = self.entries_by_user_id[user_id]
+            display_name = accounts_for_user[
+                0
+            ].audit_tg_user_name  # no list in this dict should be empty
+            cumul_tasks = []
+            cumul_hours = 0.0
+            for account in accounts_for_user:
+                for task in account.tasks:
+                    cumul_tasks.append(task)
+                cumul_hours += account.hours
+            report_entries.append((display_name, cumul_tasks, cumul_hours))
+
+        report_rows = []
+        for report_entry in report_entries:
+            task_lines = "\n".join([task.present() for task in report_entry[1]])
+            report_rows.append(
+                f"""*Contributor*: {report_entry[0]}
+*Contributions*
+{task_lines}
+*Hours*: {report_entry[2]} hours"""
+            )
+        report_rows_display = "\n".join(report_rows)
+        return f"""It's been another week! Here's what all of us managed to get done:
+
+{report_rows_display}
+
+Congratulations on the good work all around!
+"""
 
 
 class TaskModel(Base):
@@ -791,6 +867,40 @@ def create_energy_accounts_reminder(
     return decorated_create_energy_accounts_reminder_handler
 
 
+def get_energy_accounts_created_in_reporting_interval_for_group(
+    reporting_interval: timedelta, group_id: int, session: sessionmaker
+) -> List[EnergyAccountDTO]:
+    db_session = session()
+    energy_account_models = (
+        db_session.query(EnergyAccountModel)
+        .filter(
+            EnergyAccountModel.tg_group_id == group_id,
+            EnergyAccountModel.timestamp >= datetime.now() - reporting_interval,
+        )
+        .all()
+    )
+    energy_account_ids = {energy_account.id for energy_account in energy_account_models}
+    task_models = (
+        db_session.query(TaskModel)
+        .filter(
+            TaskModel.energy_account_id.in_(energy_account_ids),
+        )
+        .all()
+    )
+    db_session.close()
+    result = []
+    for energy_account_model in energy_account_models:
+        related_tasks = [
+            model
+            for model in task_models
+            if model.energy_account_id == energy_account_model.id
+        ]
+        result.append(
+            EnergyAccountDTO.from_db_model(energy_account_model, related_tasks)
+        )
+    return result
+
+
 def generate_reports(
     reporting_interval: timedelta,
     allowed_groups: TelegramGroupIdLookup,
@@ -800,15 +910,14 @@ def generate_reports(
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         for group_id in allowed_groups.keys():
-            energy_accounts_created_in_reporting_interval_for_group: List[
-                EnergyAccountModel
-            ] = get_energy_accounts_created_in_reporting_interval_for_group(
-                reoprting_interval, group_id, session
+            energy_accounts_created_in_reporting_interval_for_group = (
+                get_energy_accounts_created_in_reporting_interval_for_group(
+                    reporting_interval, group_id, session
+                )
             )
-
             # this model would already have been scoped to the voyage by virtue of the channel id, so we expect to index by user id
-            report = EnergyAccountingReport.generate_from_models(
-                energy_accounts_created_in_reporting_interval
+            report = EnergyAccountingReport.from_dtos(
+                energy_accounts_created_in_reporting_interval_for_group
             )
             await context.bot.send_message(
                 chat_id=group_id,
@@ -816,7 +925,33 @@ def generate_reports(
                 text=report.present(),
             )
 
-            update_charting_data(group_id, report)
+    return decorated_generate_reports_handler
+
+
+def test_generate_reports(
+    reporting_interval: timedelta,
+    allowed_groups: TelegramGroupIdLookup,
+    session: sessionmaker,
+) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]:
+    async def decorated_generate_reports_handler(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        for group_id in allowed_groups.keys():
+            energy_accounts_created_in_reporting_interval_for_group = (
+                get_energy_accounts_created_in_reporting_interval_for_group(
+                    reporting_interval, group_id, session
+                )
+            )
+            # this model would already have been scoped to the voyage by virtue of the channel id, so we expect to index by user id
+            report = EnergyAccountingReport.from_dtos(
+                energy_accounts_created_in_reporting_interval_for_group
+            )
+            await context.bot.send_message(
+                chat_id=group_id,
+                message_thread_id=allowed_groups[group_id],
+                text=report.present(),
+            )
 
     return decorated_generate_reports_handler
 
@@ -845,41 +980,6 @@ def main(
     sending_text_or_voice_without_start_handler = MessageHandler(
         filters.VOICE | filters.TEXT, handle_uninitialized_voice_text_input
     )
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start(allowed_groups)),
-            sending_text_or_voice_without_start_handler,
-        ],
-        states={
-            AWAITING_GROUP_SELECTION: [
-                MessageHandler(
-                    ~filters.Regex("^(/cancel)$") & filters.TEXT, handle_group_selection
-                ),
-            ],
-            AWAITING_RAW_INPUT: [
-                MessageHandler(
-                    ~filters.Regex("^(/cancel)$") & filters.TEXT, new_from_text_handler
-                ),
-                MessageHandler(filters.VOICE, new_from_voice_handler),
-            ],
-            AWAITING_HOURS_INPUT: [
-                MessageHandler(filters.TEXT, backfilling_hours_handler),
-            ],
-            CONFIRM_OR_EDIT: [
-                MessageHandler(
-                    filters.Regex("^(Yes)$"), handle_confirm(allowed_groups, session)
-                ),
-                MessageHandler(filters.Regex("^(No)$"), handle_edit),
-            ],
-            EDITING_RAW: [
-                MessageHandler(
-                    ~filters.Regex("^(/cancel)$") & filters.TEXT, handle_edit_raw_input
-                ),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    application.add_handler(conv_handler)
 
     job_queue = application.job_queue
     if job_queue is None:
@@ -921,6 +1021,47 @@ def main(
         interval=report_generation_interval,
         first=next_report_gen_datetime,
     )
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start(allowed_groups)),
+            CommandHandler(
+                "testreport",
+                test_generate_reports(
+                    copy.deepcopy(report_generation_interval), allowed_groups, session
+                ),
+            ),
+            sending_text_or_voice_without_start_handler,
+        ],
+        states={
+            AWAITING_GROUP_SELECTION: [
+                MessageHandler(
+                    ~filters.Regex("^(/cancel)$") & filters.TEXT, handle_group_selection
+                ),
+            ],
+            AWAITING_RAW_INPUT: [
+                MessageHandler(
+                    ~filters.Regex("^(/cancel)$") & filters.TEXT, new_from_text_handler
+                ),
+                MessageHandler(filters.VOICE, new_from_voice_handler),
+            ],
+            AWAITING_HOURS_INPUT: [
+                MessageHandler(filters.TEXT, backfilling_hours_handler),
+            ],
+            CONFIRM_OR_EDIT: [
+                MessageHandler(
+                    filters.Regex("^(Yes)$"), handle_confirm(allowed_groups, session)
+                ),
+                MessageHandler(filters.Regex("^(No)$"), handle_edit),
+            ],
+            EDITING_RAW: [
+                MessageHandler(
+                    ~filters.Regex("^(/cancel)$") & filters.TEXT, handle_edit_raw_input
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(conv_handler)
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
